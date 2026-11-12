@@ -1,0 +1,52 @@
+# ==============================================================================
+# .gitignore — Épico 2 · Trabalho Prático Final (TPF)
+# ==============================================================================
+
+# 1. Tokens e Segredos (NUNCA enviar para o repositório)
+token.txt
+**/token.txt
+bot.token
+**/bot.token
+.env
+**/.env
+master.key
+**/master.key
+chave.der
+**/chave.der
+
+# 2. Compilação e Ferramentas de IDE
+out/
+**/out/
+bin/
+**/bin/
+target/
+**/target/
+*.class
+**/*.class
+.idea/
+**/.idea/
+*.iml
+**/*.iml
+.vscode/
+
+# 3. Dependências e JARs locais
+lib/*.jar
+**/lib/*.jar
+
+# 4. Ficheiros de Estado e Dados em Runtime (Zero-Knowledge / Réplicas)
+*.log
+**/*.log
+registos.log
+catalogo.txt
+desafios.txt
+replicas.txt
+eventos-*.txt
+selados/
+**/selados/
+dados-*/
+**/dados-*/
+*.bin
+**/*.bin
+*.hdr
+**/*.hdr
+

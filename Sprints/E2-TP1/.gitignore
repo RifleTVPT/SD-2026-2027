@@ -13,6 +13,10 @@ master.key
 **/master.key
 chave.der
 **/chave.der
+chave.priv
+**/chave.priv
+chave.pub
+**/chave.pub
 
 # 2. Compilação e Ferramentas de IDE
 out/

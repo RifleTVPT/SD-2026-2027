@@ -30,8 +30,12 @@ import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
+import java.util.Collection;
 import java.util.EnumSet;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.*;
 
 public class LeaderBot extends ListenerAdapter {
@@ -49,10 +53,23 @@ public class LeaderBot extends ListenerAdapter {
     private static ScheduledExecutorService scheduler;
     private static ScheduledFuture<?> sealTask;
 
+    // Componentes do Sprint 3
+    private static ReplicaRegistry registry;
+    private static Catalog catalog;
+    private static PubSubHub hub;
+
+    // Controlo de envios STORE pendentes por chunk: chunkId -> Set<replicaId>
+    private static final Map<String, Set<String>> storesPendentes = new ConcurrentHashMap<>();
+    // Réplicas já tentadas por chunk (para excluir nas rondas seguintes): chunkId -> Set<replicaId>
+    private static final Map<String, Set<String>> replicasTentadas = new ConcurrentHashMap<>();
+
     public LeaderBot() {
         initMasterKeyAndStorage();
         recoverLsnFromFile();
+        registry = new ReplicaRegistry(LeaderBot::logEvent);
+        catalog = new Catalog(BASE_DIR);
         initScheduler();
+        initHub();
     }
 
     private static Path resolveBaseDir() {
@@ -142,11 +159,25 @@ public class LeaderBot extends ListenerAdapter {
     }
 
     private static synchronized void initScheduler() {
-        scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "tpf-seal-timer");
+        scheduler = Executors.newScheduledThreadPool(2, r -> {
+            Thread t = new Thread(r, "tpf-scheduler");
             t.setDaemon(true);
             return t;
         });
+        // Tarefa periódica para atualizar estados VIVA -> SUSPEITA -> MORTA
+        scheduler.scheduleAtFixedRate(() -> registry.atualizarEstados(System.currentTimeMillis()),
+                1000, 1000, TimeUnit.MILLISECONDS);
+    }
+
+    private static void initHub() {
+        hub = new PubSubHub(
+                Wire.PORTO,
+                BASE_DIR,
+                LeaderBot::processarMensagemLider,
+                (id, ev) -> registry.registarOuAtualizar(id),
+                LeaderBot::logEvent
+        );
+        hub.start();
     }
 
     // Regista eventos operacionais em eventos-lider.txt (instante;evento;detalhe).
@@ -157,6 +188,72 @@ public class LeaderBot extends ListenerAdapter {
                     StandardOpenOption.CREATE, StandardOpenOption.APPEND);
         } catch (IOException e) {
             System.err.println("Erro ao escrever em eventos-lider.txt: " + e.getMessage());
+        }
+    }
+
+    // Receção de Mensagens do Tópico 'tpf-lider' (HB, INVENTARIO, ACK)
+    private static void processarMensagemLider(String replicaAutenticada, String payload) {
+        try {
+            if (payload.startsWith("HB;")) {
+                // HB;<id>;<usados>;<quota>
+                String[] p = payload.split(";");
+                if (p.length >= 4 && replicaAutenticada.equals(p[1])) {
+                    long usados = Long.parseLong(p[2]);
+                    long quota = Long.parseLong(p[3]);
+                    registry.onHeartbeat(replicaAutenticada, usados, quota);
+                }
+            } else if (payload.startsWith("INVENTARIO;")) {
+                // INVENTARIO;<id>;<chunkId1>,<chunkId2>,...
+                String[] p = payload.split(";", 3);
+                if (p.length >= 2 && replicaAutenticada.equals(p[1])) {
+                    String lista = (p.length == 3) ? p[2] : "";
+                    int qtd = lista.isBlank() ? 0 : lista.split(",").length;
+                    System.out.println("[INVENTARIO] Réplica " + replicaAutenticada + " reportou " + qtd + " chunks.");
+                    logEvent("INVENTARIO", replicaAutenticada + " chunks=" + qtd);
+                }
+            } else if (payload.startsWith("ACK;")) {
+                // ACK;<id>;<chunkId>;<sha256>
+                String[] p = payload.split(";");
+                if (p.length < 4) return;
+                String idMsg = p[1];
+                String chunkId = p[2];
+                String sha256 = p[3];
+
+                // Validação 1: ID na mensagem == ID autenticado na ligação
+                if (!replicaAutenticada.equals(idMsg)) {
+                    logEvent("ACK-REJEITADO", chunkId + " " + idMsg + " id_forjado_por_" + replicaAutenticada);
+                    System.err.println("[ACK-REJEITADO] ID forjado: " + idMsg + " na ligação de " + replicaAutenticada);
+                    return;
+                }
+
+                // Validação 2: Hash SHA-256 == chunkId
+                if (!chunkId.equalsIgnoreCase(sha256)) {
+                    logEvent("ACK-REJEITADO", chunkId + " " + replicaAutenticada + " hash_invalido");
+                    System.err.println("[ACK-REJEITADO] Hash inválido de " + replicaAutenticada + " para " + chunkId);
+                    return;
+                }
+
+                // Validação 3: Esta réplica recebeu realmente o STORE deste chunk
+                Set<String> pendentes = storesPendentes.get(chunkId);
+                if (pendentes == null || !pendentes.remove(replicaAutenticada)) {
+                    logEvent("ACK-REJEITADO", chunkId + " " + replicaAutenticada + " store_nao_solicitado");
+                    System.err.println("[ACK-REJEITADO] ACK não solicitado de " + replicaAutenticada + " para " + chunkId);
+                    return;
+                }
+
+                Catalog.EntradaCatalogo entrada = catalog.get(chunkId);
+                if (entrada != null) {
+                    registry.confirmarReserva(replicaAutenticada, entrada.tamanho);
+                    logEvent("ACK", chunkId + " " + replicaAutenticada);
+                    boolean tornouDuravel = catalog.confirmar(chunkId, replicaAutenticada);
+                    if (tornouDuravel) {
+                        logEvent("DURAVEL", chunkId);
+                        System.out.println("[DURAVEL] Chunk " + chunkId.substring(0, 12) + "... atingiu quórum!");
+                    }
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("Erro ao processar mensagem de " + replicaAutenticada + ": " + e.getMessage());
         }
     }
 
@@ -225,18 +322,74 @@ public class LeaderBot extends ListenerAdapter {
             Files.write(tmpHdr, headerContent.getBytes(StandardCharsets.UTF_8), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
             Files.move(tmpHdr, hdrFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
 
-            logEvent("SELADO", "chunkId=" + sealed.id + ", lsnDe=" + lsnDe + ", lsnAte=" + lsnAte + ", tamanho=" + sealed.ciphertext.length);
+            long tamanho = sealed.ciphertext.length;
+            logEvent("SELADO", "chunkId=" + sealed.id + ", lsnDe=" + lsnDe + ", lsnAte=" + lsnAte + ", tamanho=" + tamanho);
             System.out.println("CHUNK SELADO: " + sealed.id + " [LSN " + lsnDe + ".." + lsnAte + "]");
 
             openChunkRecords.clear();
             openChunkByteSize = 0;
+
+            // Sprint 3: Entra no catálogo e inicia replicação
+            catalog.adicionar(sealed.id, lsnDe, lsnAte, tamanho);
+            String hdrB64 = Base64.getEncoder().encodeToString(headerContent.getBytes(StandardCharsets.UTF_8));
+            String binB64 = Base64.getEncoder().encodeToString(sealed.ciphertext);
+
+            replicasTentadas.put(sealed.id, ConcurrentHashMap.newKeySet());
+            storesPendentes.put(sealed.id, ConcurrentHashMap.newKeySet());
+            executarRondaColocacao(sealed.id, tamanho, hdrB64, binB64, 1);
         } catch (Exception e) {
             System.err.println("Erro ao selar chunk: " + e.getMessage());
             logEvent("ERRO", "Falha ao selar chunk: " + e.getMessage());
         }
     }
 
-    // Registo imediato dos 7 Slash Commands ao ficar pronto (controlado por flag para poupar plafond do Discord)
+    // Executa uma ronda de colocação do chunk nas réplicas escolhidas pelo Placement
+    private static void executarRondaColocacao(String chunkId, long tamanho, String hdrB64, String binB64, int ronda) {
+        Set<String> confirmadas = catalog.copias(chunkId);
+        int emFalta = Wire.R - confirmadas.size();
+        if (emFalta <= 0) return;
+
+        if (ronda > Wire.MAX_RONDAS) {
+            if (confirmadas.size() < Wire.R) {
+                logEvent("SUBREPLICADO", chunkId + " " + confirmadas.size() + "/" + Wire.R);
+            }
+            return;
+        }
+
+        logEvent("RONDA", chunkId + " " + ronda);
+        Set<String> tentadas = replicasTentadas.computeIfAbsent(chunkId, k -> ConcurrentHashMap.newKeySet());
+        List<String> escolhidas = registry.reserveAndChoose(chunkId, tamanho, emFalta, tentadas);
+
+        if (confirmadas.size() + escolhidas.size() < Wire.R) {
+            logEvent("SUBREPLICADO", chunkId + " " + (confirmadas.size() + escolhidas.size()) + "/" + Wire.R);
+        }
+
+        if (escolhidas.isEmpty()) return;
+
+        Set<String> pendentes = storesPendentes.computeIfAbsent(chunkId, k -> ConcurrentHashMap.newKeySet());
+        String msgStore = "STORE;" + chunkId + ";" + hdrB64 + ";" + binB64;
+
+        for (String repId : escolhidas) {
+            tentadas.add(repId);
+            pendentes.add(repId);
+            logEvent("STORE", chunkId + " -> " + repId);
+            hub.publish(Wire.topicReplica(repId), msgStore);
+        }
+
+        // Agenda verificação ao fim de ACK_TIMEOUT_MS
+        scheduler.schedule(() -> {
+            for (String repId : escolhidas) {
+                if (pendentes.remove(repId)) {
+                    registry.libertar(repId, tamanho);
+                }
+            }
+            Set<String> atuais = catalog.copias(chunkId);
+            if (atuais.size() < Wire.R) {
+                executarRondaColocacao(chunkId, tamanho, hdrB64, binB64, ronda + 1);
+            }
+        }, Wire.ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+    }
+
     @Override
     public void onReady(ReadyEvent event) {
         System.out.println("LeaderBot online como: " + event.getJDA().getSelfUser().getAsTag());
@@ -257,7 +410,7 @@ public class LeaderBot extends ListenerAdapter {
             return;
         }
 
-        for (Guild guild : guilds) {//para cada server onde está o bot, vai registar os 7 comandos
+        for (Guild guild : guilds) {
             System.out.println("A registar Slash Commands na Guild: " + guild.getName() + " (ID: " + guild.getId() + ")...");
             guild.updateCommands().addCommands(
                     // 1. /registar <texto>
@@ -265,15 +418,14 @@ public class LeaderBot extends ListenerAdapter {
                             .addOption(OptionType.STRING, "texto", "Texto da mensagem a registar", true),
 
                     // 2. /estado
-                    Commands.slash("estado", "Mostra o estado do líder, das réplicas e blocos com cópias em falta"),
+                    Commands.slash("estado", "Mostra o estado do líder, das réplicas e blocos"),
 
-                    // 3. /config r <n> (usa STRING para validar 'abc' e valores inválidos conforme Critério de Aceitação)
                     Commands.slash("config", "Configuração do sistema (ex: fator de replicação R)")
                             .addSubcommands(new SubcommandData("r", "Define o fator de replicação R")
                                     .addOption(OptionType.STRING, "n", "Novo valor para o fator R (inteiro >= 1)", true)),
 
                     // 4. /recuperar <de> <ate>
-                    Commands.slash("recuperar", "Recupera os registos num intervalo de LSN")//lsn = last sequence number
+                    Commands.slash("recuperar", "Recupera os registos num intervalo de LSN")
                             .addOption(OptionType.INTEGER, "de", "LSN inicial", true)
                             .addOption(OptionType.INTEGER, "ate", "LSN final", true),
 
@@ -297,14 +449,14 @@ public class LeaderBot extends ListenerAdapter {
 
     // Tratamento de Slash Commands
     @Override
-    public void onSlashCommandInteraction(SlashCommandInteractionEvent event) {//função que vai ser chamada quando o bot receber um slash command
-        String cmd = event.getName();//nome do comando que foi chamado, ex: "registar", "estado", etc
+    public void onSlashCommandInteraction(SlashCommandInteractionEvent event) {
+        String cmd = event.getName();
 
         // 1. Verificação de permissões para comandos de administração
         if (isRestrictedCommand(cmd)) {
             Member member = event.getMember();
-            if (member == null || !hasAdminRole(member)) {//se nao existir o membro ou nao tiver o papel admin-arquivo
-                event.reply("❌ Acesso recusado: o comando `/" + cmd + "` está restrito a membros com o papel `" + ROLE_ADMIN + "`.")//responde ao utilizador que o comando foi recusado
+            if (member == null || !hasAdminRole(member)) {
+                event.reply("❌ Acesso recusado: o comando `/" + cmd + "` está restrito a membros com o papel `" + ROLE_ADMIN + "`.")
                         .setEphemeral(true)
                         .queue();
                 return;
@@ -325,7 +477,41 @@ public class LeaderBot extends ListenerAdapter {
             }
 
             case "estado" -> {
-                event.reply("«/estado recebido: líder online, réplicas conectadas=0, blocos com cópias em falta=0 — provisório»").queue();
+                registry.atualizarEstados(System.currentTimeMillis());
+                List<ReplicaRegistry.InfoReplica> reps = registry.snapshot();
+                Collection<Catalog.EntradaCatalogo> chunks = catalog.todas();
+
+                int selados = 0, duraveis = 0, subreplicados = 0;
+                Map<String, Integer> chunksPorReplica = new HashMap<>();
+
+                for (Catalog.EntradaCatalogo c : chunks) {
+                    if (c.estado == Catalog.EstadoChunk.SELADO) selados++;
+                    else duraveis++;
+                    if (c.replicas.size() < Wire.R) subreplicados++;
+                    for (String rId : c.replicas) {
+                        chunksPorReplica.merge(rId, 1, Integer::sum);
+                    }
+                }
+
+                StringBuilder sb = new StringBuilder("📊 **Estado do Sistema (R=" + Wire.R + ", Quórum=" + Wire.quorumDuravel(Wire.R) + ")**\n");
+                sb.append("**Chunks:** Total=").append(chunks.size())
+                  .append(" | `SELADO`=").append(selados)
+                  .append(" | `DURAVEL`=").append(duraveis)
+                  .append(" | Subreplicados=").append(subreplicados).append("\n\n");
+
+                sb.append("**Réplicas (" + reps.size() + "):**\n");
+                if (reps.isEmpty()) {
+                    sb.append("_Nenhuma réplica ativa._\n");
+                } else {
+                    for (ReplicaRegistry.InfoReplica r : reps) {
+                        int nChunks = chunksPorReplica.getOrDefault(r.id, 0);
+                        sb.append("- **").append(r.id).append("**: `").append(r.monitor.getEstado())
+                          .append("` | Ocupação: ").append(r.usados).append("/").append(r.quota).append(" B")
+                          .append(" (Reservados: ").append(r.reservados).append(" B)")
+                          .append(" | Chunks: ").append(nChunks).append("\n");
+                    }
+                }
+                event.reply(sb.toString()).queue();
             }
 
             case "config" -> {
@@ -356,16 +542,14 @@ public class LeaderBot extends ListenerAdapter {
                     event.reply("❌ Argumento inválido: o fator de replicação R deve ser um número inteiro >= 1.").setEphemeral(true).queue();
                     return;
                 }
-                event.reply("«/config r recebido: n=" + n + " — provisório»").queue();
+                event.reply("«/config r recebido: n=" + n + " — provisório (convergência no Sprint 4)»").queue();
             }
 
             case "recuperar" -> {
-                OptionMapping optDe = event.getOption("de");//opcao de receber valor inicial, é do tipo mapping em vez de inteiro porque os valores podem ser negativos
+                OptionMapping optDe = event.getOption("de");
                 OptionMapping optAte = event.getOption("ate");
                 if (optDe == null || optAte == null) {
-                    event.reply("❌ Argumentos ausentes: indique 'de' e 'ate'.").setEphemeral(true).queue();//setEphemeral(true) faz com que a mensagem seja enviada apenas para o utilizador que fez o comando
-                    //todas as mensagens de erro ou não sao enviadas para uma fila, porque o bot pode receber varios comandos ao mesmo tempo
-                    //event.reply serve para mandar mensagem para o discord, ja que o contacto entre o lider a correr no cmd e o bot é feito via api por websocket
+                    event.reply("❌ Argumentos ausentes: indique 'de' e 'ate'.").setEphemeral(true).queue();
                     return;
                 }
                 long de = optDe.getAsLong();
@@ -379,11 +563,13 @@ public class LeaderBot extends ListenerAdapter {
                     event.reply("❌ Argumento inválido: 'de' (" + de + ") não pode ser maior que 'ate' (" + ate + ").").setEphemeral(true).queue();
                     return;
                 }
-                event.reply("«/recuperar recebido: de=" + de + ", ate=" + ate + " — ainda não implementado»").queue();
+                event.reply("«/recuperar recebido: de=" + de + ", ate=" + ate + " — provisório (Sprint 4)»").queue();
             }
 
             case "replica-token" -> {
-                event.reply("«/replica-token recebido: token gerado='token-provisorio-sprint1' — provisório»").queue();
+                String token = hub.gerarToken();
+                event.reply("🔑 **Token de registo gerado (uso único, válido por 10 min):**\n`" + token + "`")
+                        .setEphemeral(true).queue();
             }
 
             case "replica-remover" -> {
@@ -393,7 +579,12 @@ public class LeaderBot extends ListenerAdapter {
                     event.reply("❌ Argumento inválido: indique o identificador da réplica a remover.").setEphemeral(true).queue();
                     return;
                 }
-                event.reply("«/replica-remover recebido: id='" + id + "' — provisório»").queue();
+                registry.removerReplica(id);
+                boolean existia = hub.revogarReplica(id);
+                logEvent("REPLICA-REMOVIDA", id);
+                event.reply(existia
+                        ? "🗑️ Réplica **" + id + "** removida de `replicas.txt`, desligada e excluída da colocação."
+                        : "⚠️ Réplica **" + id + "** não estava em `replicas.txt`, mas foi marcada como excluída.").queue();
             }
 
             case "rajada" -> {
@@ -414,7 +605,6 @@ public class LeaderBot extends ListenerAdapter {
                     event.reply("❌ Argumento inválido: 'intervaloMs' não pode ser negativo.").setEphemeral(true).queue();
                     return;
                 }
-
                 String autor = event.getUser().getName();
                 event.reply("🚀 Rajada de " + n + " registos iniciada...").queue();
                 new Thread(() -> {
@@ -452,14 +642,14 @@ public class LeaderBot extends ListenerAdapter {
         event.getMessage().reply("✅ Mensagem gravada no arquivo durável (LSN: **" + assignedLsn + "**)").queue();
     }
 
-    private boolean isRestrictedCommand(String cmd) {//compara o nome do comando 
+    private boolean isRestrictedCommand(String cmd) {
         return "config".equalsIgnoreCase(cmd)
                 || "replica-token".equalsIgnoreCase(cmd)
                 || "replica-remover".equalsIgnoreCase(cmd)
                 || "rajada".equalsIgnoreCase(cmd);
     }
 
-    private boolean hasAdminRole(Member member) {//percorre todos os cargos do utilizador e verifica se algum deles é "admin-arquivo"
+    private boolean hasAdminRole(Member member) {
         for (Role role : member.getRoles()) {
             if (ROLE_ADMIN.equalsIgnoreCase(role.getName())) return true;
         }
@@ -470,13 +660,13 @@ public class LeaderBot extends ListenerAdapter {
     private static String resolveToken(String[] args) {
         if (args.length > 0 && !args[0].isBlank()) return args[0].trim();
 
-        String envToken = System.getenv("DISCORD_TOKEN");//tenta encontrar o token na variavel de ambiente DISCORD_TOKEN
+        String envToken = System.getenv("DISCORD_TOKEN");
         if (envToken != null && !envToken.isBlank()) return envToken.trim();
 
-        String envBotToken = System.getenv("BOT_TOKEN");//tenta encontrar o token na variavel de ambiente BOT_TOKEN
+        String envBotToken = System.getenv("BOT_TOKEN");
         if (envBotToken != null && !envBotToken.isBlank()) return envBotToken.trim();
 
-        String propToken = System.getProperty("tpf.token");//tenta encontrar o token na propriedade de sistema tpf.token
+        String propToken = System.getProperty("tpf.token");
         if (propToken != null && !propToken.isBlank()) return propToken.trim();
 
         File[] locais = new File[] {

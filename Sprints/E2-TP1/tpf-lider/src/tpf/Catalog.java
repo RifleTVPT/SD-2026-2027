@@ -6,49 +6,15 @@ import java.nio.file.*;
 import java.util.*;
 
 /**
- * Catálogo Persistente e Autoritativo de Chunks do Líder (catalogo.txt).
- * 
- * PAPEL NO SISTEMA:
- * Mantém o índice de metadados de todos os chunks gerados pelo Líder no sistema distribuído:
- * - Mapeia cada 'chunkId' ao intervalo de registos contidos [lsnDe..lsnAte] e tamanho em bytes;
- * - Regista a lista de réplicas que já confirmaram formalmente ter uma cópia do bloco (via ACK);
- * - Gere a transição de estado de cada chunk:
- *   * SELADO: Bloco cifrado e guardado localmente, mas com menos cópias do que o quórum de durabilidade;
- *   * DURAVEL: Bloco confirmado por pelo menos quorumDuravel(R) réplicas (maioria e >= W_MIN);
- * - Determina a condição de 'subreplicado': quando possui menos de R cópias confirmadas
- *   (um chunk pode ser DURAVEL e subreplicado simultaneamente, ex: 2 cópias com R=3).
- * 
- * MODELO DE THREADS E CONCORRÊNCIA:
- * - Acedido concorrentemente por:
- *   1. Thread de Selagem do Líder: Invoca adicionar() ao fechar um chunk aberto;
- *   2. Threads de Entrada do WebSocket (PubSubHub): Invocam confirmar() ao processar mensagens ACK;
- *   3. Threads de Slash Commands (JDA): Invocam todas() para construir a resposta do comando /estado;
- *   4. Threads de Recuperação (Sprint 4): Invocam copias() e get().
- * - Sincronização via 'synchronized(this)' em todos os métodos que manipulam o mapa de entradas.
- * 
- * ESCRITA ATÓMICA NO DISCO (Crash-Consistency):
- * Cada alteração ao catálogo regrava o ficheiro completo num temporário ('catalogo.txt.tmp')
- * e executa uma substituição atómica via 'Files.move(..., ATOMIC_MOVE)'. Isto garante que
- * em caso de quebra de energia ou falha do processo do Líder, o catálogo nunca fica corrompido.
- * 
- * FORMATO DE catalogo.txt:
- * chunkId;lsnDe;lsnAte;tamanho;replicasSeparadasPorVirgula;estado
- * 
- * ONDE É UTILIZADA:
- * Instanciada no construtor do LeaderBot.
+ * Catálogo persistente do Líder (catalogo.txt).
+ * Formato por linha: chunkId;lsnDe;lsnAte;tamanho;replicas;estado
  */
 public final class Catalog {
 
-    /**
-     * Estados de ciclo de vida de um chunk no catálogo.
-     */
     public enum EstadoChunk {
         SELADO, DURAVEL
     }
 
-    /**
-     * Entrada individual representativa de um chunk no catálogo.
-     */
     public static final class EntradaCatalogo {
         public final String chunkId;
         public final long lsnDe;
@@ -65,10 +31,6 @@ public final class Catalog {
             this.estado = estado;
         }
 
-        /**
-         * Serializa a entrada numa linha delimitada por ponto e vírgula:
-         * "chunkId;lsnDe;lsnAte;tamanho;rep1,rep2;DURAVEL"
-         */
         public String toLine() {
             String reps = String.join(",", replicas);
             return chunkId + ";" + lsnDe + ";" + lsnAte + ";" + tamanho + ";" + reps + ";" + estado.name();
@@ -78,18 +40,11 @@ public final class Catalog {
     private final Path catalogPath;
     private final Map<String, EntradaCatalogo> entradas = new LinkedHashMap<>();
 
-    /**
-     * Inicializa o catálogo localizando o ficheiro 'catalogo.txt' na pasta base e carregando
-     * as entradas existentes do disco no arranque do Líder.
-     */
     public Catalog(Path baseDir) {
         this.catalogPath = baseDir.resolve("catalogo.txt");
         carregar();
     }
 
-    /**
-     * Lê e reconstrói o catálogo em memória a partir de 'catalogo.txt' no arranque.
-     */
     private synchronized void carregar() {
         if (!Files.exists(catalogPath)) return;
         try {
@@ -118,11 +73,6 @@ public final class Catalog {
         }
     }
 
-    /**
-     * Regista um novo chunk recém-selado com estado inicial SELADO e persiste atomicamente.
-     * 
-     * Onde é utilizado: LeaderBot.selarChunkAtual().
-     */
     public synchronized void adicionar(String chunkId, long lsnDe, long lsnAte, long tamanho) {
         EntradaCatalogo e = new EntradaCatalogo(chunkId, lsnDe, lsnAte, tamanho, EstadoChunk.SELADO);
         entradas.put(chunkId, e);
@@ -130,17 +80,8 @@ public final class Catalog {
     }
 
     /**
-     * Regista a confirmação formal (ACK) recebida de uma réplica para um chunk:
-     * - Adiciona a réplica ao conjunto de detentores da cópia;
-     * - Avalia se atingiu o quórum de durabilidade: replicas.size() >= Wire.quorumDuravel(Wire.R);
-     * - Se atingir o quórum, transita o estado de SELADO para DURAVEL;
-     * - Regrava atomicamente o catálogo em disco.
-     * 
-     * Onde é utilizado: LeaderBot.processarMensagemLider() ao validar um ACK.
-     *
-     * @param chunkId Identificador do chunk confirmado
-     * @param replicaId Identificador da réplica que enviou o ACK
-     * @return true se esta confirmação específica causou a transição para DURAVEL
+     * Regista a confirmação (ACK) de uma réplica para um chunk.
+     * Devolve true se esta confirmação fez o chunk transitar para DURAVEL agora.
      */
     public synchronized boolean confirmar(String chunkId, String replicaId) {
         EntradaCatalogo e = entradas.get(chunkId);
@@ -162,33 +103,19 @@ public final class Catalog {
         return tornouDuravel;
     }
 
-    /**
-     * Devolve o conjunto de IDs de réplicas que possuem cópias confirmadas do chunk.
-     */
     public synchronized Set<String> copias(String chunkId) {
         EntradaCatalogo e = entradas.get(chunkId);
         return e == null ? Collections.emptySet() : new LinkedHashSet<>(e.replicas);
     }
 
-    /**
-     * Obtém uma entrada de catálogo por chunkId.
-     */
     public synchronized EntradaCatalogo get(String chunkId) {
         return entradas.get(chunkId);
     }
 
-    /**
-     * Devolve uma cópia de todas as entradas existentes no catálogo para inspeção.
-     * 
-     * Onde é utilizado: LeaderBot (/estado).
-     */
     public synchronized Collection<EntradaCatalogo> todas() {
         return new ArrayList<>(entradas.values());
     }
 
-    /**
-     * Gravação atómica de 'catalogo.txt' no disco (Temporary File + ATOMIC_MOVE).
-     */
     public synchronized void gravarAtomico() {
         try {
             StringBuilder sb = new StringBuilder();

@@ -5,42 +5,16 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 
-/**
- * Representa a estrutura de dados interna e a serialização de Chunks em claro.
- * 
- * PAPEL NO SISTEMA:
- * - Agrupa registos individuais (RecordEntry) provenientes das mensagens do Discord (#arquivo)
- *   ou do comando /registar.
- * - Converte registos estruturados num array de bytes contíguo com padding nulo (0x00).
- * - O padding alinha o tamanho a múltiplos de PAD_BYTES (4 KB), garantindo o modelo
- *   ZERO-KNOWLEDGE: observadores externos e réplicas voluntárias não conseguem inferir
- *   o número exato nem o tamanho real dos registos armazenados dentro do bloco cifrado.
- * 
- * MODELO DE THREADS E CONCORRÊNCIA:
- * - RecordEntry é uma classe imutável (campos final).
- * - Chunk contém apenas métodos utilitários estáticos (serialize / deserialize) sem estado partilhado.
- * - Totalmente thread-safe e reentrante: pode ser invocado concorrentemente por múltiplas
- *   threads sem qualquer contenção de trincos.
- * 
- * ONDE É UTILIZADA:
- * - LeaderBot.selarChunkAtual(): serializa a lista aberta de registos antes da cifra.
- * - ChunkCryptoTest: valida que dados com padding recuperam exatamente os mesmos registos originais.
- */
 public final class Chunk {
 
-    /**
-     * Entrada individual de registo durável armazenada dentro de um chunk.
-     */
+    // Representa uma entrada de registo individual dentro de um chunk.
     public static class RecordEntry {
-        public final long lsn;          // Log Sequence Number (monotónico crescente)
-        public final long instante;     // Timestamp Epoch em milissegundos
-        public final String autor;      // Nome do utilizador Discord ou sistema
-        public final String canal;      // Nome do canal (#arquivo ou slash-command)
-        public final String texto;      // Texto do registo codificado em Base64
+        public final long lsn;
+        public final long instante;
+        public final String autor;
+        public final String canal;
+        public final String texto; // Texto guardado em Base64
 
-        /**
-         * Cria uma nova entrada de registo imutável.
-         */
         public RecordEntry(long lsn, long instante, String autor, String canal, String texto) {
             this.lsn = lsn;
             this.instante = instante;
@@ -49,12 +23,7 @@ public final class Chunk {
             this.texto = texto;
         }
 
-        /**
-         * Converte a entrada numa linha delimitada por ponto e vírgula (;):
-         * "lsn;instante;autor;canal;textoBase64"
-         * 
-         * Onde é utilizado: Chunk.serialize() e gravação do LeaderBot em registos.log.
-         */
+        // Converte a entrada de registo numa linha de texto formatada com ponto e vírgula (;).
         public String toLine() {
             return lsn + ";" + instante + ";" + autor + ";" + canal + ";" + texto;
         }
@@ -75,15 +44,8 @@ public final class Chunk {
         }
     }
 
-    /**
-     * Serializa uma lista de registos para UTF-8 e aplica padding até um múltiplo exato de padBytes.
-     * 
-     * Onde é utilizado: LeaderBot.selarChunkAtual() imediatamente antes de invocar ChunkCrypto.seal().
-     *
-     * @param records Lista de registos a empacotar
-     * @param padBytes Tamanho do bloco de alinhamento (normalmente Wire.PAD_BYTES = 4096)
-     * @return Array de bytes com texto UTF-8 seguido de bytes 0x00 de preenchimento
-     */
+    // Serializa uma lista de registos e aplica padding até um múltiplo de PAD_BYTES.
+    // O padding serve para ocultar o tamanho exato dos dados (modelo Zero-Knowledge).
     public static byte[] serialize(List<RecordEntry> records, int padBytes) {
         StringBuilder sb = new StringBuilder();
         for (RecordEntry r : records) {
@@ -102,15 +64,7 @@ public final class Chunk {
         return padded;
     }
 
-    /**
-     * Reconstrói a lista original de registos a partir de um bloco decifrado com padding.
-     * Descarta os bytes nulos (0x00) no final até encontrar o último caractere '\n' válido.
-     * 
-     * Onde é utilizado: ChunkCryptoTest e futura recuperação de registos no Sprint 4.
-     *
-     * @param paddedData Array de bytes decifrado contendo o padding
-     * @return Lista reconstruída de RecordEntry
-     */
+    // Faz a operação inversa: reconstrói a lista de registos a partir dos bytes (ignorando o padding a 0x00).
     public static List<RecordEntry> deserialize(byte[] paddedData) {
         int validLen = paddedData.length;
         while (validLen > 0 && paddedData[validLen - 1] == 0) {
@@ -140,6 +94,4 @@ public final class Chunk {
         }
         return records;
     }
-
-    private Chunk() {}
 }

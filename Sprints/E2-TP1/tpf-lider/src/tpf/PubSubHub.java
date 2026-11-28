@@ -15,48 +15,15 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiConsumer;
 
 /**
- * Hub Publish/Subscribe sobre WebSocket Alojado no Processo do Líder (LeaderBot).
- * 
- * PAPEL NO SISTEMA:
- * Constitui a infraestrutura central de rede que interliga o Líder e todas as Réplicas Voluntárias:
- * 1. Autenticação Criptográfica Forte (Ed25519):
- *    - No 1.º registo, exige um token efémero (válido por 10 min) gerado no Discord via /replica-token
- *      e uma chave pública Ed25519;
- *    - Em todas as ligações, envia um DESAFIO com nonce aleatório (32 bytes) e valida a PROVA (assinatura Ed25519);
- *    - O token só é consumido e a réplica só é registada em 'replicas.txt' após verificação bem-sucedida da PROVA.
- * 2. Máquina de Estados por Ligação:
- *    - NOVA -> DESAFIADA -> AUTENTICADA. Qualquer mensagem fora de ordem ou ilegal desliga o cliente imediatamente.
- * 3. Controlo Rigoroso de Acesso a Tópicos (Isolamento Zero-Knowledge):
- *    - Uma réplica apenas pode subscrever o seu tópico privado 'tpf-r-<o seu id>' e o de controlo 'tpf-ctl';
- *    - Uma réplica apenas pode publicar no tópico 'tpf-lider';
- *    - Qualquer tentativa de subscrever ou espiar tópicos de terceiros fecha a conexão e regista 'ERRO'.
- * 4. Encaminhamento em Memória:
- *    - publish(topico, msg) envia mensagens apenas aos WebSockets subscritos no respetivo tópico;
- *    - Mensagens publicadas em 'tpf-lider' são entregues diretamente em processo ao LeaderBot
- *      com o identificador autenticado da sessão WebSocket garantido pela camada de transporte.
- * 
- * MODELO DE THREADS E CONCORRÊNCIA:
- * - Estende org.java_websocket.server.WebSocketServer, que gere o seu próprio grupo interno de threads:
- *   * 1 Thread Select / Accept de I/O de rede;
- *   * Múltiplas Threads Worker de Despacho (Worker Threads) que invocam onOpen, onMessage, onClose e onError.
- * - Estruturas de dados concorrentes (ConcurrentHashMap) para sessoes, tokens, chavesRegistadas e subscricoes.
- * - Métodos de gravação de ficheiros (replicas.txt) protegidos com 'synchronized(this)' e escritos com ATOMIC_MOVE.
- * 
- * ONDE É UTILIZADA:
- * Instanciada e iniciada no arranque do LeaderBot (hub.start()).
+ * Hub Publish/Subscribe sobre WebSocket alojado no processo do Líder.
+ * Gere autenticação desafio-resposta Ed25519, tokens de 1.º registo e encaminhamento de tópicos.
  */
 public final class PubSubHub extends WebSocketServer {
 
-    /**
-     * Estados do handshake de autenticação de cada socket conectado.
-     */
     private enum EstadoLigacao {
         NOVA, DESAFIADA, AUTENTICADA
     }
 
-    /**
-     * Contexto de sessão mantido para cada cliente WebSocket conectado.
-     */
     private static final class Sessao {
         EstadoLigacao estado = EstadoLigacao.NOVA;
         String replicaId;
@@ -66,9 +33,6 @@ public final class PubSubHub extends WebSocketServer {
         final Set<String> topicos = ConcurrentHashMap.newKeySet();
     }
 
-    /**
-     * Informação de controlo de tokens efémeros de registo.
-     */
     private static final class TokenInfo {
         final long criadoMs;
         boolean usado = false;
@@ -85,20 +49,11 @@ public final class PubSubHub extends WebSocketServer {
     private final Map<WebSocket, Sessao> sessoes = new ConcurrentHashMap<>();
     private final Map<String, Set<WebSocket>> subscricoes = new ConcurrentHashMap<>();
 
-    private final BiConsumer<String, String> onMensagemLider; // Callback: (replicaIdAutenticado, payload)
-    private final BiConsumer<String, String> onReplicaAutenticada; // Callback: (replicaId, evento)
+    private final BiConsumer<String, String> onMensagemLider; // (replicaIdAutenticado, payload)
+    private final BiConsumer<String, String> onReplicaAutenticada; // (replicaId, evento)
     private final BiConsumer<String, String> eventLogger;
     private final SecureRandom rng = new SecureRandom();
 
-    /**
-     * Cria e configura o hub Pub/Sub.
-     *
-     * @param porto Porto de escuta TCP (normalmente Wire.PORTO = 8765)
-     * @param baseDir Diretório de trabalho onde reside 'replicas.txt'
-     * @param onMensagemLider Callback invocada quando uma réplica publica em 'tpf-lider'
-     * @param onReplicaAutenticada Callback invocada quando uma réplica conclui com sucesso a autenticação
-     * @param eventLogger Callback para gravação de eventos operacionais em 'eventos-lider.txt'
-     */
     public PubSubHub(int porto, Path baseDir,
                      BiConsumer<String, String> onMensagemLider,
                      BiConsumer<String, String> onReplicaAutenticada,
@@ -112,9 +67,6 @@ public final class PubSubHub extends WebSocketServer {
         carregarReplicas();
     }
 
-    /**
-     * Lê as réplicas já autorizadas e as suas chaves públicas Ed25519 de 'replicas.txt' no arranque.
-     */
     private synchronized void carregarReplicas() {
         if (!Files.exists(replicasPath)) return;
         try {
@@ -135,9 +87,6 @@ public final class PubSubHub extends WebSocketServer {
         }
     }
 
-    /**
-     * Persiste atomicamente a lista autorizada de réplicas em 'replicas.txt' (Temporary File + ATOMIC_MOVE).
-     */
     private synchronized void gravarReplicasAtomico() {
         try {
             StringBuilder sb = new StringBuilder();
@@ -153,12 +102,6 @@ public final class PubSubHub extends WebSocketServer {
         }
     }
 
-    /**
-     * Gera um novo token efémero aleatório de 18 bytes codificado em URL-safe Base64.
-     * Válido por 10 minutos para registo único de uma réplica.
-     * 
-     * Onde é utilizado: LeaderBot ao responder ao slash command /replica-token.
-     */
     public String gerarToken() {
         byte[] buf = new byte[18];
         rng.nextBytes(buf);
@@ -167,18 +110,13 @@ public final class PubSubHub extends WebSocketServer {
         return tok;
     }
 
-    /**
-     * Revoga a autorização de uma réplica: remove a chave pública de 'replicas.txt',
-     * persiste o ficheiro e fecha imediatamente qualquer ligação WebSocket ativa dessa réplica.
-     * 
-     * Onde é utilizado: LeaderBot ao responder ao slash command /replica-remover <id>.
-     */
     public synchronized boolean revogarReplica(String id) {
         PublicKey removida = chavesRegistadas.remove(id);
         chavesB64.remove(id);
         if (removida != null) {
             gravarReplicasAtomico();
         }
+        // Desliga qualquer sessão ativa dessa réplica
         for (Map.Entry<WebSocket, Sessao> entry : sessoes.entrySet()) {
             if (id.equals(entry.getValue().replicaId)) {
                 entry.getKey().close(1008, "Replica removida pelo administrador");
@@ -187,11 +125,6 @@ public final class PubSubHub extends WebSocketServer {
         return removida != null;
     }
 
-    /**
-     * Publica uma mensagem num tópico, entregando-a a todas as conexões que o subscreveram.
-     * 
-     * Onde é utilizado: LeaderBot.distribuirChunkReplicas() para enviar 'STORE' em 'tpf-r-<id>'.
-     */
     public void publish(String topico, String mensagem) {
         Set<WebSocket> subs = subscricoes.get(topico);
         if (subs == null) return;
@@ -249,12 +182,6 @@ public final class PubSubHub extends WebSocketServer {
         }
     }
 
-    /**
-     * Processa a mensagem inicial OLA:
-     * - 1.º registo: OLA;<id>;<chavePublicaB64>;<token>
-     * - Ligações seguintes: OLA;<id>
-     * Gera um nonce aleatório de 32 bytes e responde com 'DESAFIO;<nonceB64>'.
-     */
     private void processarOla(WebSocket conn, Sessao s, String msg) throws Exception {
         String[] parts = msg.split(";", 4);
         if (!"OLA".equals(parts[0]) || parts.length < 2) {
@@ -269,7 +196,7 @@ public final class PubSubHub extends WebSocketServer {
         }
 
         if (parts.length == 4) {
-            // Primeiro registo com token
+            // 1.º registo: OLA;<id>;<chavePublicaB64>;<token>
             String pkB64 = parts[2].trim();
             String token = parts[3].trim();
 
@@ -287,7 +214,7 @@ public final class PubSubHub extends WebSocketServer {
             s.chavePendente = parseEd25519PublicKey(pkB64);
             s.tokenPendente = token;
         } else if (parts.length == 2) {
-            // Religações subsequentes da réplica
+            // Ligações seguintes: OLA;<id>
             PublicKey pk = chavesRegistadas.get(id);
             if (pk == null) {
                 rejeitarEDesligar(conn, s, "Replica nao registada (falta token): " + id);
@@ -299,7 +226,6 @@ public final class PubSubHub extends WebSocketServer {
             return;
         }
 
-        // Gera desafio criptográfico novo de uso único (32 bytes)
         byte[] nonce = new byte[32];
         rng.nextBytes(nonce);
         s.replicaId = id;
@@ -309,10 +235,6 @@ public final class PubSubHub extends WebSocketServer {
         conn.send("DESAFIO;" + s.nonceB64);
     }
 
-    /**
-     * Valida a resposta 'PROVA;<id>;<assinaturaB64>' enviada pela réplica.
-     * Consome o token e persiste o par em 'replicas.txt' apenas se a assinatura for válida.
-     */
     private void processarProva(WebSocket conn, Sessao s, String msg) throws Exception {
         String[] parts = msg.split(";", 3);
         if (parts.length != 3 || !"PROVA".equals(parts[0])) {
@@ -333,7 +255,7 @@ public final class PubSubHub extends WebSocketServer {
             return;
         }
 
-        // Consome o token de uso único e persiste a réplica em replicas.txt
+        // Consome o token e persiste a chave apenas após a PROVA válida
         if (s.tokenPendente != null) {
             synchronized (this) {
                 TokenInfo ti = tokens.get(s.tokenPendente);
@@ -349,20 +271,15 @@ public final class PubSubHub extends WebSocketServer {
             }
         }
 
-        s.nonceB64 = null; // Descarta o nonce após validação
+        s.nonceB64 = null; // Descarta o nonce após uso
         s.estado = EstadoLigacao.AUTENTICADA;
         onReplicaAutenticada.accept(id, "AUTENTICADA");
     }
 
-    /**
-     * Processa comandos de subscrição (SUB) e publicação (PUB) após o nó estar AUTENTICADO.
-     * Aplica as regras estritas de isolamento de tópicos.
-     */
     private void processarAutenticada(WebSocket conn, Sessao s, String msg) {
         if (msg.startsWith("SUB;")) {
             String topico = msg.substring(4).trim();
             String permitido = Wire.topicReplica(s.replicaId);
-            // Só pode subscrever o seu próprio tópico tpf-r-<id> ou o tópico global de controlo tpf-ctl
             if (!topico.equals(permitido) && !topico.equals(Wire.TOPICO_CTL)) {
                 rejeitarEDesligar(conn, s, "Subscricao proibida de " + s.replicaId + " no topico " + topico);
                 return;
@@ -378,23 +295,16 @@ public final class PubSubHub extends WebSocketServer {
             String topico = parts[1].trim();
             String payload = parts[2];
 
-            // Réplicas só podem publicar para o tópico do líder
             if (!Wire.TOPICO_LIDER.equals(topico)) {
                 rejeitarEDesligar(conn, s, "Publicacao proibida de " + s.replicaId + " no topico " + topico);
                 return;
             }
-            // Entrega a mensagem ao LeaderBot acompanhada do ID autenticado na sessão
             onMensagemLider.accept(s.replicaId, payload);
         } else {
             rejeitarEDesligar(conn, s, "Comando invalido apos autenticacao: " + msg);
         }
     }
 
-    /**
-     * Valida a assinatura digital Ed25519 do desafio.
-     * Dados assinados: "tpf-registo|" + id + "|" + nonceB64 (em UTF-8).
-     * Vincula a assinatura tanto ao nonce como ao identificador da ligação, prevenindo ataques de personificação.
-     */
     public static boolean verificarProva(String id, String nonceB64, String sigB64, PublicKey pubKey) {
         try {
             byte[] dados = ("tpf-registo|" + id + "|" + nonceB64).getBytes(StandardCharsets.UTF_8);
@@ -408,18 +318,12 @@ public final class PubSubHub extends WebSocketServer {
         }
     }
 
-    /**
-     * Converte uma chave pública codificada em Base64 (formato X.509) num objeto PublicKey Ed25519.
-     */
     private static PublicKey parseEd25519PublicKey(String pkB64) throws Exception {
         byte[] bytes = Base64.getDecoder().decode(pkB64);
         KeyFactory kf = KeyFactory.getInstance("Ed25519");
         return kf.generatePublic(new X509EncodedKeySpec(bytes));
     }
 
-    /**
-     * Regista um evento de erro no log e encerra a conexão WebSocket com código de fecho 1008 (Policy Violation).
-     */
     private void rejeitarEDesligar(WebSocket conn, Sessao s, String motivo) {
         String quem = (s != null && s.replicaId != null) ? s.replicaId : "desconhecido";
         System.err.println("[HUB ERRO] (" + quem + "): " + motivo);

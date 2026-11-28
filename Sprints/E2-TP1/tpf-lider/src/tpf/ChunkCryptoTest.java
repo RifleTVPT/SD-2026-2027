@@ -10,28 +10,6 @@ import java.security.SecureRandom;
 import java.util.Base64;
 import java.util.List;
 
-/**
- * Suite de Testes Criptográficos Unitários e Validação de Integridade do Arquivo.
- * 
- * PAPEL NO SISTEMA:
- * Valida de forma automatizada todos os requisitos criptográficos obrigatórios do enunciado:
- * 1. Teste de Roundtrip: Cifrar um conjunto de registos, decifrá-los e confirmar que são idênticos.
- * 2. Testes de Resiliência e Adulteração: Garante que a decifra (open) falha com exceção segura
- *    se qualquer um dos seguintes elementos for adulterado:
- *    - Um único byte do ficheiro .bin (texto cifrado);
- *    - O valor do salt guardado no .hdr;
- *    - O valor do nonce guardado no .hdr;
- *    - A versão da chave (keyVersion);
- *    - A própria master key do Líder (tentativa com chave diferente).
- * 3. Validação de Ficheiros Reais: Percorre a pasta local 'selados/' e decifra todos os blocos
- *    físicos gerados pelo LeaderBot durante as execuções.
- * 
- * MODELO DE THREADS:
- * Execução sequencial na Thread Main (arranque direto em linha de comandos).
- * 
- * COMO EXECUTAR:
- * java -cp "out;lib/*" tpf.ChunkCryptoTest
- */
 public class ChunkCryptoTest {
 
     public static void main(String[] args) throws Exception {

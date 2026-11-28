@@ -38,46 +38,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.*;
 
-/**
- * Orquestrador Central e Nó Líder do Arquivo Distribuído (LeaderBot).
- * 
- * PAPEL NO SISTEMA:
- * É o componente central e autoritativo do sistema distribuído:
- * 1. Ponto de Entrada de Dados (Discord Gateway):
- *    - Monitoriza o canal de texto '#arquivo' e processa o Slash Command '/registar';
- *    - Atribui sequencialmente o LSN (Log Sequence Number) a cada novo registo;
- *    - Persiste imediatamente em 'registos.log' com garantia física através de 'channel.force(true)' (fsync).
- * 2. Selagem e Cifra Zero-Knowledge:
- *    - Agrupa registos em memória no chunk aberto;
- *    - Quando atinge CHUNK_MAX_BYTES (64 KB) ou após inatividade de SELAGEM_MS (5 s), sela o chunk;
- *    - Aplica padding nulo (PAD_BYTES = 4 KB), deriva a chave DEK via HKDF-SHA256 da master.key
- *      e cifra em AES-256-GCM gerando ficheiros atómicos em 'selados/<chunkId>.bin' e '.hdr'.
- * 3. Colocação e Replicação Parcial (Sprint 3):
- *    - Regista o chunk no Catalog com estado SELADO;
- *    - Consulta o ReplicaRegistry e utiliza o algoritmo Placement (Rendezvous Hashing)
- *      para selecionar até R = 3 réplicas que não estejam MORTAS e tenham espaço livre suficiente;
- *    - Reserva atómicamente espaço em disco nas réplicas escolhidas;
- *    - Publica a mensagem 'STORE;<chunkId>;<hdrB64>;<binB64>' nos tópicos privados 'tpf-r-<id>' via PubSubHub;
- *    - Aguarda confirmações 'ACK' válidas das réplicas, transitando o chunk para DURAVEL assim que
- *      atinge o quórum de durabilidade: max(W_MIN, floor(R/2) + 1) = 2 confirmações (para R=3);
- *    - Se uma réplica falhar ou expirar ACK_TIMEOUT_MS (4 s), liberta a reserva e agenda novas rondas
- *      (até MAX_RONDAS = 3) para tentar obter as R cópias pretendidas.
- * 
- * MODELO DE THREADS E CONCORRÊNCIA:
- * 1. Thread Main: Inicializa master.key, recupera LSN de registos.log, arranca o agendador e o JDA;
- * 2. Threads Gateway do JDA (WebSocket do Discord): Recebem mensagens de utilizadores (#arquivo e slash commands);
- * 3. Threads Worker do PubSubHub (WebSocket Server): Recebem heartbeats, inventários e ACKs das réplicas;
- * 4. Thread do Agendador Periódico (ScheduledExecutorService "tpf-scheduler"):
- *    - Dispara a selagem por tempo (sealOpenChunk) após 5 segundos;
- *    - Avalia transições de estado das réplicas (VIVA -> SUSPEITA -> MORTA) a cada 1 segundo;
- *    - Gere timeouts de ACK e rondas subsequentes de colocação.
- * 
- * HIERARQUIA DE SINCRONIZAÇÃO (Prevenção de Race Conditions e Deadlocks):
- * - Os métodos de escrita no log e controlo do chunk aberto (registarDuravel, addToOpenChunk, sealOpenChunk)
- *   são estáticos e 'synchronized', serializando adições concorrentes de LSN;
- * - ReplicaRegistry e Catalog possuem os seus próprios monitores internos 'synchronized(this)',
- *   sendo acedidos ordenadamente sem dependências circulares.
- */
 public class LeaderBot extends ListenerAdapter {
 
     private static final String ROLE_ADMIN = "admin-arquivo";
@@ -93,7 +53,7 @@ public class LeaderBot extends ListenerAdapter {
     private static ScheduledExecutorService scheduler;
     private static ScheduledFuture<?> sealTask;
 
-    // Componentes centrais do Sprint 3
+    // Componentes do Sprint 3
     private static ReplicaRegistry registry;
     private static Catalog catalog;
     private static PubSubHub hub;
@@ -103,9 +63,6 @@ public class LeaderBot extends ListenerAdapter {
     // Réplicas já tentadas por chunk (para excluir nas rondas seguintes): chunkId -> Set<replicaId>
     private static final Map<String, Set<String>> replicasTentadas = new ConcurrentHashMap<>();
 
-    /**
-     * Construtor do LeaderBot. Inicializa chaves, recupera estado e arranca os serviços.
-     */
     public LeaderBot() {
         initMasterKeyAndStorage();
         recoverLsnFromFile();
@@ -115,9 +72,6 @@ public class LeaderBot extends ListenerAdapter {
         initHub();
     }
 
-    /**
-     * Localiza a pasta base do projeto (suporta execução na raiz do repositório ou dentro da subpasta).
-     */
     private static Path resolveBaseDir() {
         Path p1 = Paths.get("Sprints/E2-TP1/tpf-lider");
         if (Files.isDirectory(p1)) return p1;
@@ -126,10 +80,7 @@ public class LeaderBot extends ListenerAdapter {
         return Paths.get(".");
     }
 
-    /**
-     * Inicializa o motor de cifra: lê a master.key (32 bytes) existente ou gera uma nova no 1.º arranque.
-     * Restringe as permissões do ficheiro para leitura exclusiva pelo dono.
-     */
+    // Verifica e gera a master.key (32 bytes) no primeiro arranque e cria a pasta selados/
     private static synchronized void initMasterKeyAndStorage() {
         try {
             Files.createDirectories(BASE_DIR.resolve("selados"));
@@ -155,9 +106,6 @@ public class LeaderBot extends ListenerAdapter {
         }
     }
 
-    /**
-     * Restringe as permissões da chave mestra apenas ao dono (POSIX ou ACL Windows).
-     */
     private static void restrictToOwnerOnly(Path path) {
         try {
             if (FileSystems.getDefault().supportedFileAttributeViews().contains("posix")) {
@@ -169,7 +117,13 @@ public class LeaderBot extends ListenerAdapter {
                     AclEntry entry = AclEntry.newBuilder()
                             .setType(AclEntryType.ALLOW)
                             .setPrincipal(owner)
-                            .setPermissions(EnumSet.allOf(AclEntryPermission.class))
+                            .setPermissions(EnumSet.of(
+                                    AclEntryPermission.READ_DATA,
+                                    AclEntryPermission.READ_ATTRIBUTES,
+                                    AclEntryPermission.READ_NAMED_ATTRS,
+                                    AclEntryPermission.READ_ACL,
+                                    AclEntryPermission.SYNCHRONIZE
+                            ))
                             .build();
                     aclView.setAcl(Collections.singletonList(entry));
                 } else {
@@ -182,9 +136,7 @@ public class LeaderBot extends ListenerAdapter {
         }
     }
 
-    /**
-     * Recupera o último LSN a partir de 'registos.log' no arranque para evitar duplicações de sequência.
-     */
+    // Lê o registos.log existente no arranque para continuar o LSN sem repetições nem saltos.
     private static synchronized void recoverLsnFromFile() {
         Path logPath = BASE_DIR.resolve("registos.log");
         if (!Files.exists(logPath)) return;
@@ -206,22 +158,17 @@ public class LeaderBot extends ListenerAdapter {
         }
     }
 
-    /**
-     * Inicializa o pool de agendamento de tarefas em segundo plano (selagem por tempo e avaliação de heartbeats).
-     */
     private static synchronized void initScheduler() {
         scheduler = Executors.newScheduledThreadPool(2, r -> {
             Thread t = new Thread(r, "tpf-scheduler");
             t.setDaemon(true);
             return t;
         });
+        // Tarefa periódica para atualizar estados VIVA -> SUSPEITA -> MORTA
         scheduler.scheduleAtFixedRate(() -> registry.atualizarEstados(System.currentTimeMillis()),
                 1000, 1000, TimeUnit.MILLISECONDS);
     }
 
-    /**
-     * Arranca o servidor WebSocket do PubSubHub embutido no processo do Líder.
-     */
     private static void initHub() {
         hub = new PubSubHub(
                 Wire.PORTO,
@@ -233,9 +180,7 @@ public class LeaderBot extends ListenerAdapter {
         hub.start();
     }
 
-    /**
-     * Regista eventos operacionais em 'eventos-lider.txt' no formato: instante;evento;detalhe.
-     */
+    // Regista eventos operacionais em eventos-lider.txt (instante;evento;detalhe).
     private static synchronized void logEvent(String evento, String detalhe) {
         String linha = System.currentTimeMillis() + ";" + evento + ";" + detalhe + "\n";
         try {
@@ -246,11 +191,7 @@ public class LeaderBot extends ListenerAdapter {
         }
     }
 
-    /**
-     * Despacha mensagens publicadas pelas réplicas no tópico 'tpf-lider': HB, INVENTARIO e ACK.
-     * 
-     * Onde é utilizado: Callback registada no PubSubHub ao receber mensagens no tópico do líder.
-     */
+    // Receção de Mensagens do Tópico 'tpf-lider' (HB, INVENTARIO, ACK)
     private static void processarMensagemLider(String replicaAutenticada, String payload) {
         try {
             if (payload.startsWith("HB;")) {
@@ -278,21 +219,21 @@ public class LeaderBot extends ListenerAdapter {
                 String chunkId = p[2];
                 String sha256 = p[3];
 
-                // Validação 1: O identificador na mensagem tem de coincidir com a sessão WebSocket autenticada
+                // Validação 1: ID na mensagem == ID autenticado na ligação
                 if (!replicaAutenticada.equals(idMsg)) {
                     logEvent("ACK-REJEITADO", chunkId + " " + idMsg + " id_forjado_por_" + replicaAutenticada);
                     System.err.println("[ACK-REJEITADO] ID forjado: " + idMsg + " na ligação de " + replicaAutenticada);
                     return;
                 }
 
-                // Validação 2: O hash reportado tem de ser exatamente o chunkId
+                // Validação 2: Hash SHA-256 == chunkId
                 if (!chunkId.equalsIgnoreCase(sha256)) {
                     logEvent("ACK-REJEITADO", chunkId + " " + replicaAutenticada + " hash_invalido");
                     System.err.println("[ACK-REJEITADO] Hash inválido de " + replicaAutenticada + " para " + chunkId);
                     return;
                 }
 
-                // Validação 3: Esta réplica tem de constar da lista de envios STORE pendentes deste chunk
+                // Validação 3: Esta réplica recebeu realmente o STORE deste chunk
                 Set<String> pendentes = storesPendentes.get(chunkId);
                 if (pendentes == null || !pendentes.remove(replicaAutenticada)) {
                     logEvent("ACK-REJEITADO", chunkId + " " + replicaAutenticada + " store_nao_solicitado");
@@ -316,16 +257,7 @@ public class LeaderBot extends ListenerAdapter {
         }
     }
 
-    /**
-     * Gravação Atómica e Durável de um novo registo:
-     * 1. Incrementa o LSN;
-     * 2. Formata a linha delimitada por ';';
-     * 3. Grava no FileChannel de 'registos.log' e executa channel.force(true) (fsync físico);
-     * 4. Regista evento 'REGISTO' em eventos-lider.txt;
-     * 5. Acrescenta ao chunk aberto em memória.
-     * 
-     * Onde é utilizado: onMessageReceived (#arquivo) e onSlashCommandInteraction (/registar e /rajada).
-     */
+    // Método centralizado de escrita durável (atribui LSN, escreve no log, força fsync e adiciona ao chunk).
     public static synchronized long registarDuravel(String autor, String canal, String texto) {
         currentLsn++;
         long instante = System.currentTimeMillis();
@@ -335,7 +267,7 @@ public class LeaderBot extends ListenerAdapter {
         Path logPath = BASE_DIR.resolve("registos.log");
         try (FileChannel channel = FileChannel.open(logPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND)) {
             channel.write(ByteBuffer.wrap(linha.getBytes(StandardCharsets.UTF_8)));
-            channel.force(true); // fsync obrigatório
+            channel.force(true); // Força o fsync físico para o disco antes de prosseguir
         } catch (IOException e) {
             throw new RuntimeException("Erro crítico no fsync de registos.log: " + e.getMessage(), e);
         }
@@ -345,10 +277,7 @@ public class LeaderBot extends ListenerAdapter {
         return currentLsn;
     }
 
-    /**
-     * Adiciona um registo ao lote aberto em memória e verifica se atingiu o limite de tamanho (64 KB).
-     * Se for o 1.º registo do lote, agenda a selagem automática por tempo (5 s).
-     */
+    // Adiciona registos ao chunk aberto e gere a selagem por tamanho ou tempo (SELAGEM_MS).
     private static synchronized void addToOpenChunk(Chunk.RecordEntry entry) {
         if (openChunkRecords.isEmpty()) {
             sealTask = scheduler.schedule(LeaderBot::sealOpenChunk, Wire.SELAGEM_MS, TimeUnit.MILLISECONDS);
@@ -363,14 +292,7 @@ public class LeaderBot extends ListenerAdapter {
         }
     }
 
-    /**
-     * Sela o chunk aberto:
-     * 1. Serializa com padding de 4 KB (Zero-Knowledge);
-     * 2. Cifra em AES-256-GCM com HKDF gerando o identificador chunkId;
-     * 3. Persiste atomicamente em 'selados/<chunkId>.bin' e '.hdr' com ATOMIC_MOVE;
-     * 4. Regista evento 'SELADO' em eventos-lider.txt;
-     * 5. Regista no Catalog e inicia a ronda 1 de replicação pelas réplicas.
-     */
+    // Sela o chunk aberto, aplica padding, cifra com ChunkCrypto e guarda em selados/.
     private static synchronized void sealOpenChunk() {
         if (openChunkRecords.isEmpty()) return;
 
@@ -407,6 +329,7 @@ public class LeaderBot extends ListenerAdapter {
             openChunkRecords.clear();
             openChunkByteSize = 0;
 
+            // Sprint 3: Entra no catálogo e inicia replicação
             catalog.adicionar(sealed.id, lsnDe, lsnAte, tamanho);
             String hdrB64 = Base64.getEncoder().encodeToString(headerContent.getBytes(StandardCharsets.UTF_8));
             String binB64 = Base64.getEncoder().encodeToString(sealed.ciphertext);
@@ -420,13 +343,7 @@ public class LeaderBot extends ListenerAdapter {
         }
     }
 
-    /**
-     * Executa uma ronda de distribuição de um chunk pelas réplicas:
-     * - Calcula cópias em falta (R - confirmadas);
-     * - Escolhe réplicas via reserveAndChoose excluindo as já tentadas;
-     * - Envia STORE via WebSocket no tópico 'tpf-r-<id>';
-     * - Agenda verificação após ACK_TIMEOUT_MS (4 s) para libertar reservas pendentes e avançar ronda.
-     */
+    // Executa uma ronda de colocação do chunk nas réplicas escolhidas pelo Placement
     private static void executarRondaColocacao(String chunkId, long tamanho, String hdrB64, String binB64, int ronda) {
         Set<String> confirmadas = catalog.copias(chunkId);
         int emFalta = Wire.R - confirmadas.size();
@@ -459,6 +376,7 @@ public class LeaderBot extends ListenerAdapter {
             hub.publish(Wire.topicReplica(repId), msgStore);
         }
 
+        // Agenda verificação ao fim de ACK_TIMEOUT_MS
         scheduler.schedule(() -> {
             for (String repId : escolhidas) {
                 if (pendentes.remove(repId)) {
@@ -472,14 +390,11 @@ public class LeaderBot extends ListenerAdapter {
         }, Wire.ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
     }
 
-    /**
-     * Regista os 7 Slash Commands na nuvem do Discord quando o bot fica online.
-     * Utiliza a flag -Dtpf.registarComandos=true para evitar estourar o limite de 200 pedidos/dia da API do Discord.
-     */
     @Override
     public void onReady(ReadyEvent event) {
         System.out.println("LeaderBot online como: " + event.getJDA().getSelfUser().getAsTag());
 
+        // Flag recomendada pelo docente para evitar exceder o rate limit diário (200 updates/dia) do Discord
         boolean registar = Boolean.getBoolean("tpf.registarComandos")
                 || Boolean.parseBoolean(System.getenv().getOrDefault("REGISTAR_COMANDOS", "false"));
 
@@ -505,7 +420,6 @@ public class LeaderBot extends ListenerAdapter {
                     // 2. /estado
                     Commands.slash("estado", "Mostra o estado do líder, das réplicas e blocos"),
 
-                    // 3. /config r <n>
                     Commands.slash("config", "Configuração do sistema (ex: fator de replicação R)")
                             .addSubcommands(new SubcommandData("r", "Define o fator de replicação R")
                                     .addOption(OptionType.STRING, "n", "Novo valor para o fator R (inteiro >= 1)", true)),
@@ -533,14 +447,12 @@ public class LeaderBot extends ListenerAdapter {
         }
     }
 
-    /**
-     * Interceta e executa as interações de Slash Commands enviadas pelos utilizadores do Discord.
-     */
+    // Tratamento de Slash Commands
     @Override
     public void onSlashCommandInteraction(SlashCommandInteractionEvent event) {
         String cmd = event.getName();
 
-        // 1. Controlo de permissões RBAC para comandos administrativos
+        // 1. Verificação de permissões para comandos de administração
         if (isRestrictedCommand(cmd)) {
             Member member = event.getMember();
             if (member == null || !hasAdminRole(member)) {
@@ -551,7 +463,7 @@ public class LeaderBot extends ListenerAdapter {
             }
         }
 
-        // 2. Execução do comando solicitado
+        // 2. Processamento e validação de argumentos por comando
         switch (cmd) {
             case "registar" -> {
                 OptionMapping optTexto = event.getOption("texto");
@@ -712,12 +624,13 @@ public class LeaderBot extends ListenerAdapter {
         }
     }
 
-    /**
-     * Interceta mensagens de utilizadores humanos publicadas no canal de texto '#arquivo'.
-     */
+    // Tratamento de mensagens no canal de texto #arquivo
     @Override
     public void onMessageReceived(MessageReceivedEvent event) {
+        // Ignora mensagens de outros bots (inclusive as do próprio LeaderBot)
         if (event.getAuthor().isBot()) return;
+
+        // Apenas escuta no canal denominado "arquivo"
         if (!CHANNEL_ARQUIVO.equalsIgnoreCase(event.getChannel().getName())) return;
 
         String conteudo = event.getMessage().getContentRaw();
@@ -729,9 +642,6 @@ public class LeaderBot extends ListenerAdapter {
         event.getMessage().reply("✅ Mensagem gravada no arquivo durável (LSN: **" + assignedLsn + "**)").queue();
     }
 
-    /**
-     * Identifica comandos restritos que exigem o papel 'admin-arquivo'.
-     */
     private boolean isRestrictedCommand(String cmd) {
         return "config".equalsIgnoreCase(cmd)
                 || "replica-token".equalsIgnoreCase(cmd)
@@ -739,9 +649,6 @@ public class LeaderBot extends ListenerAdapter {
                 || "rajada".equalsIgnoreCase(cmd);
     }
 
-    /**
-     * Verifica se o membro solicitante possui o papel 'admin-arquivo'.
-     */
     private boolean hasAdminRole(Member member) {
         for (Role role : member.getRoles()) {
             if (ROLE_ADMIN.equalsIgnoreCase(role.getName())) return true;
@@ -749,13 +656,7 @@ public class LeaderBot extends ListenerAdapter {
         return false;
     }
 
-    /**
-     * Procura o token do Bot nas várias origens permitidas por ordem de precedência:
-     * 1. Argumentos da CLI;
-     * 2. Variável de ambiente DISCORD_TOKEN ou BOT_TOKEN;
-     * 3. Propriedade -Dtpf.token;
-     * 4. Ficheiro token.txt ou bot.token.
-     */
+    // Leitura segura do Token do Bot (Ambiente -> ficheiro local -> System Property)
     private static String resolveToken(String[] args) {
         if (args.length > 0 && !args[0].isBlank()) return args[0].trim();
 
@@ -788,9 +689,6 @@ public class LeaderBot extends ListenerAdapter {
         return null;
     }
 
-    /**
-     * Ponto de entrada da aplicação Líder (LeaderBot).
-     */
     public static void main(String[] args) {
         String token = resolveToken(args);
         if (token == null) {
@@ -805,9 +703,9 @@ public class LeaderBot extends ListenerAdapter {
 
         try {
             System.out.println("A iniciar LeaderBot...");
-            JDABuilder.createDefault(token)
-                    .enableIntents(GatewayIntent.MESSAGE_CONTENT)
-                    .addEventListeners(new LeaderBot())
+            JDABuilder.createDefault(token)//inicia coisas do JDA
+                    .enableIntents(GatewayIntent.MESSAGE_CONTENT)//permite ler o conteúdo das mensagens
+                    .addEventListeners(new LeaderBot())//adiciona o LeaderBot como ouvinte de eventos
                     .build();
         } catch (Exception e) {
             System.err.println("Falha ao iniciar o LeaderBot: " + e.getMessage());

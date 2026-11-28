@@ -15,39 +15,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Stream;
 
 /**
- * Serviço de Réplica Voluntária do Arquivo Distribuído (tpf-replica).
- * 
- * PAPEL NO SISTEMA:
- * Representa um nó de armazenamento independente executado numa máquina voluntária de terceiros:
- * - Não confia no Líder nem o Líder confia nela (Modelo Zero-Knowledge):
- *   * Guarda apenas bytes cifrados (.bin) e metadados opacos (.hdr);
- *   * Nunca tem acesso à master key, ao catálogo nem ao conteúdo em claro dos registos;
- * - Respeita a sua quota física de armazenamento local em disco (quotaBytes);
- * - Gere a sua própria identidade criptográfica persistente com um par de chaves Ed25519
- *   gerado na pasta 'dados-<id>/' (chave.priv e chave.pub);
- * - Autentica-se perante o Líder através de desafio-resposta Ed25519;
- * - Emite Heartbeats regulares (a cada 2 s) reportando espaço ocupado e quota;
- * - Ao receber um pedido 'STORE', verifica a quota, valida o hash SHA-256 do ficheiro cifrado,
- *   persiste atomicamente em disco (.bin e .hdr) e apenas depois responde com 'ACK'.
- * 
- * MODELO DE THREADS E CONCORRÊNCIA:
- * 1. Thread Main: Lê argumentos da linha de comandos, inicializa chaves e arranca o serviço;
- * 2. Threads do Cliente WebSocket do JDK (HttpClient): Recebem eventos de rede de forma assíncrona
- *    (onOpen, onText, onClose, onError) e invocam o processamento de STORE e DESAFIO;
- * 3. Thread do Temporizador de Heartbeat (ScheduledExecutorService "replica-hb"):
- *    Dispara a cada PERIODO_HB_MS (2 s) publicando 'PUB;tpf-lider;HB;...';
- * 4. Mecanismo de Backoff Exponencial: Agenda tentativas de religação com espera duplicada
- *    (de 1 s até um teto de 30 s) caso o Líder esteja temporariamente indisponível.
- * 
- * HIERARQUIA DE SINCRONIZAÇÃO:
- * - A atualização e verificação de bytesUsados e a escrita de ficheiros são sincronizadas
- *   (synchronized) para impedir que múltiplos STORE simultâneos estourem a quota local.
- * - AtomicBoolean protege o agendamento único de religações.
- * 
- * COMO EXECUTAR:
- * java -cp out tpf.ReplicaService <id> <url> <quotaBytes> [token]
- * Exemplo:
- * java -cp out tpf.ReplicaService A ws://localhost:8765 8388608 TOKEN_DISCORD
+ * Serviço de Réplica Voluntária (tpf-replica).
+ * Execução: java -cp out tpf.ReplicaService <id> <url> <quotaBytes> [token]
  */
 public final class ReplicaService implements WebSocket.Listener {
 
@@ -72,14 +41,11 @@ public final class ReplicaService implements WebSocket.Listener {
     private long backoffMs = Wire.BACKOFF_MIN_MS;
     private final AtomicBoolean religacaoAgendada = new AtomicBoolean();
 
-    // Flag opcional para a Experiência 8 do guião (simular hash errado no ACK)
+    // Flag opcional para a Experiência 8 (simular hash errado no ACK)
     private static final boolean CORROMPER_ACK = Boolean.getBoolean("tpf.corromperAck");
-    // Flag opcional para a Experiência 9 do guião (simular ACK com ID forjado)
+    // Flag opcional para a Experiência 9 (simular ACK com ID falso)
     private static final String FORJAR_ID = System.getProperty("tpf.forjarId", "");
 
-    /**
-     * Inicializa o serviço da réplica, criando a pasta de dados e carregando as chaves Ed25519.
-     */
     public ReplicaService(String id, String url, long quotaBytes, String token) throws Exception {
         this.id = id;
         this.uri = URI.create(url);
@@ -94,10 +60,6 @@ public final class ReplicaService implements WebSocket.Listener {
         calcularBytesUsados();
     }
 
-    /**
-     * Carrega as chaves Ed25519 existentes em dados-<id>/ ou gera um novo par se for a 1.ª execução.
-     * Assegura que o ficheiro da chave privada tem permissões restritas apenas ao dono.
-     */
     private void inicializarChavesEd25519() throws Exception {
         Path privPath = pastaDados.resolve("chave.priv");
         Path pubPath = pastaDados.resolve("chave.pub");
@@ -120,9 +82,6 @@ public final class ReplicaService implements WebSocket.Listener {
         }
     }
 
-    /**
-     * Restringe as permissões do sistema de ficheiros para que apenas o dono leia a chave privada.
-     */
     private void restringirApenasDono(Path path) {
         try {
             if (FileSystems.getDefault().supportedFileAttributeViews().contains("posix")) {
@@ -134,17 +93,17 @@ public final class ReplicaService implements WebSocket.Listener {
                     AclEntry entry = AclEntry.newBuilder()
                             .setType(AclEntryType.ALLOW)
                             .setPrincipal(owner)
-                            .setPermissions(EnumSet.allOf(AclEntryPermission.class))
-                            .build();
+                            .setPermissions(EnumSet.of(
+                                    AclEntryPermission.READ_DATA, AclEntryPermission.WRITE_DATA,
+                                    AclEntryPermission.READ_ATTRIBUTES, AclEntryPermission.WRITE_ATTRIBUTES,
+                                    AclEntryPermission.SYNCHRONIZE
+                            )).build();
                     aclView.setAcl(Collections.singletonList(entry));
                 }
             }
         } catch (Exception ignored) {}
     }
 
-    /**
-     * Calcula o total de bytes ocupados somando o tamanho de todos os ficheiros .bin existentes na pasta de dados.
-     */
     private synchronized void calcularBytesUsados() throws IOException {
         long soma = 0;
         try (Stream<Path> files = Files.list(pastaDados)) {
@@ -157,9 +116,6 @@ public final class ReplicaService implements WebSocket.Listener {
         this.bytesUsados = soma;
     }
 
-    /**
-     * Regista um evento operacional no log local 'eventos-<id>.txt' (timestamp;evento;detalhe).
-     */
     private synchronized void logEvento(String evento, String detalhe) {
         String linha = System.currentTimeMillis() + ";" + evento + ";" + detalhe + "\n";
         try {
@@ -170,16 +126,10 @@ public final class ReplicaService implements WebSocket.Listener {
         }
     }
 
-    /**
-     * Inicia a primeira ligação ao Hub.
-     */
     public void iniciar() {
         conectar();
     }
 
-    /**
-     * Estabelece a ligação WebSocket assíncrona ao Líder usando o HttpClient do JDK.
-     */
     private void conectar() {
         religacaoAgendada.set(false);
         System.out.println("[" + id + "] A ligar a " + uri + "...");
@@ -194,9 +144,6 @@ public final class ReplicaService implements WebSocket.Listener {
                 });
     }
 
-    /**
-     * Agenda uma nova tentativa de ligação com backoff exponencial (1 s, 2 s, 4 s... até 30 s).
-     */
     private void agendarReligacao() {
         if (!religacaoAgendada.compareAndSet(false, true)) return;
         if (hbTask != null) {
@@ -216,7 +163,6 @@ public final class ReplicaService implements WebSocket.Listener {
         this.wsAtual = webSocket;
         webSocket.request(1);
 
-        // Se tiver token de 1.º registo, envia OLA com chave pública e token; senão envia apenas OLA;<id>
         if (tokenRegisto != null && !tokenRegisto.isBlank()) {
             String pubB64 = Base64.getEncoder().encodeToString(keyPair.getPublic().getEncoded());
             webSocket.sendText("OLA;" + id + ";" + pubB64 + ";" + tokenRegisto, true);
@@ -237,28 +183,23 @@ public final class ReplicaService implements WebSocket.Listener {
         return null;
     }
 
-    /**
-     * Interpreta mensagens recebidas do hub: DESAFIO ou STORE.
-     */
     private void processarMensagem(WebSocket ws, String msg) {
         try {
             if (msg.startsWith("DESAFIO;")) {
-                // Responde ao desafio criptográfico com a assinatura Ed25519
                 String nonceB64 = msg.substring(8).trim();
                 String assinaturaB64 = assinarDesafio(nonceB64);
                 ws.sendText("PROVA;" + id + ";" + assinaturaB64, true);
 
-                // Solicita subscrição ao seu tópico privado e ao canal de controlo
+                // O hub só aceita estes SUB depois de validar a PROVA.
                 ws.sendText("SUB;" + Wire.topicReplica(id), true);
                 ws.sendText("SUB;" + Wire.TOPICO_CTL, true);
 
-                // Repõe o backoff para o mínimo após sucesso e descarta o token de uso único
+                // A partir deste ponto usa-se apenas OLA;<id>.
                 backoffMs = Wire.BACKOFF_MIN_MS;
                 tokenRegisto = null;
                 logEvento("LIGADO", "Prova enviada ao hub " + uri);
-                System.out.println("[" + id + "] Prova enviada e subscrições ativas!");
+                System.out.println("[" + id + "] Prova enviada e subscricoes solicitadas!");
 
-                // Envia inventário de chunks e inicia temporizador de heartbeats
                 enviarInventario(ws);
                 iniciarHeartbeats(ws);
 
@@ -271,10 +212,6 @@ public final class ReplicaService implements WebSocket.Listener {
         }
     }
 
-    /**
-     * Assina digitalmente o nonce com a chave privada Ed25519 da réplica.
-     * Dados assinados: "tpf-registo|" + id + "|" + nonceB64.
-     */
     private String assinarDesafio(String nonceB64) throws Exception {
         byte[] payload = ("tpf-registo|" + id + "|" + nonceB64).getBytes(StandardCharsets.UTF_8);
         Signature sig = Signature.getInstance("Ed25519");
@@ -283,9 +220,6 @@ public final class ReplicaService implements WebSocket.Listener {
         return Base64.getEncoder().encodeToString(sig.sign());
     }
 
-    /**
-     * Inicia o envio periódico de heartbeats a cada 2 segundos.
-     */
     private void iniciarHeartbeats(WebSocket ws) {
         if (hbTask != null) hbTask.cancel(false);
         hbTask = scheduler.scheduleAtFixedRate(() -> {
@@ -296,9 +230,6 @@ public final class ReplicaService implements WebSocket.Listener {
         }, 0, Wire.PERIODO_HB_MS, TimeUnit.MILLISECONDS);
     }
 
-    /**
-     * Envia a lista de identificadores de chunks guardados localmente logo após a ligação.
-     */
     private synchronized void enviarInventario(WebSocket ws) throws IOException {
         List<String> ids = new ArrayList<>();
         try (Stream<Path> files = Files.list(pastaDados)) {
@@ -313,15 +244,8 @@ public final class ReplicaService implements WebSocket.Listener {
         ws.sendText("PUB;" + Wire.TOPICO_LIDER + ";INVENTARIO;" + id + ";" + lista, true);
     }
 
-    /**
-     * Processa a gravação segura de um chunk recebido via 'STORE;<chunkId>;<hdrB64>;<binB64>':
-     * 1. Verifica se já existe em disco (idempotência: responde logo ACK);
-     * 2. Verifica se cabe na quota;
-     * 3. Valida a integridade SHA-256 do texto cifrado;
-     * 4. Escreve atomicamente .bin e .hdr (Temporary File + ATOMIC_MOVE);
-     * 5. Envia formalmente o ACK ao líder.
-     */
     private synchronized void processarStore(WebSocket ws, String msg) throws Exception {
+        // STORE;<chunkId>;<hdrB64>;<binB64>
         String[] parts = msg.split(";", 4);
         if (parts.length != 4) return;
 
@@ -332,28 +256,28 @@ public final class ReplicaService implements WebSocket.Listener {
         Path binFile = pastaDados.resolve(chunkId + ".bin");
         Path hdrFile = pastaDados.resolve(chunkId + ".hdr");
 
-        // Idempotência: se já existe, responde com ACK sem reescrever
+        // 5. Se já existe, responde com ACK sem reescrever
         if (Files.exists(binFile) && Files.exists(hdrFile)) {
             String hashExistente = sha256Hex(Files.readAllBytes(binFile));
             enviarAck(ws, chunkId, hashExistente);
             return;
         }
 
-        // 1. Verificação de Quota física
+        // 1. Verifica quota
         if (bytesUsados + binBytes.length > quotaBytes) {
             logEvento("QUOTA", "Recusado chunk " + chunkId + " (" + binBytes.length + " B)");
             System.out.println("[" + id + "] QUOTA excedida ao tentar guardar " + chunkId.substring(0, 12));
             return;
         }
 
-        // 2. Verificação de Integridade por Endereçamento por Conteúdo
+        // 2. Verifica integridade SHA-256 do .bin
         String hashCalculado = sha256Hex(binBytes);
         if (!hashCalculado.equalsIgnoreCase(chunkId)) {
             logEvento("ERRO", "Hash invalido no STORE para " + chunkId);
             return;
         }
 
-        // 3. Escrita Atómica com ATOMIC_MOVE
+        // 3. Escreve .bin e .hdr atomicamente
         Path tmpBin = pastaDados.resolve(chunkId + ".bin.tmp");
         Files.write(tmpBin, binBytes, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
         Files.move(tmpBin, binFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
@@ -366,22 +290,16 @@ public final class ReplicaService implements WebSocket.Listener {
         logEvento("STORE", chunkId + " (" + binBytes.length + " B)");
         System.out.println("[" + id + "] Chunk guardado: " + chunkId.substring(0, 12) + "... (" + bytesUsados + "/" + quotaBytes + " B)");
 
-        // 4. Confirmação durável ao líder
+        // 4. Só depois envia ACK
         enviarAck(ws, chunkId, hashCalculado);
     }
 
-    /**
-     * Envia o ACK formal de durabilidade para o tópico do líder.
-     */
     private void enviarAck(WebSocket ws, String chunkId, String sha256) {
         String idAEnviar = FORJAR_ID.isBlank() ? id : FORJAR_ID;
         String hashAEnviar = CORROMPER_ACK ? "0000000000000000000000000000000000000000000000000000000000000000" : sha256;
         ws.sendText("PUB;" + Wire.TOPICO_LIDER + ";ACK;" + idAEnviar + ";" + chunkId + ";" + hashAEnviar, true);
     }
 
-    /**
-     * Calcula o hash SHA-256 em hexadecimal.
-     */
     private static String sha256Hex(byte[] data) throws Exception {
         return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(data));
     }
@@ -413,6 +331,7 @@ public final class ReplicaService implements WebSocket.Listener {
         ReplicaService service = new ReplicaService(id, url, quota, token);
         service.iniciar();
 
+        // Mantém o processo vivo
         Thread.currentThread().join();
     }
 }
